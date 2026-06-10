@@ -306,7 +306,7 @@ type Inc struct {
 	EnableSetCollation bool `toml:"enable_set_collation" json:"enable_set_collation"`
 	// 开启sql统计
 	EnableSqlStatistic bool `toml:"enable_sql_statistic" json:"enable_sql_statistic"`
-	// 在MySQL8.0检测是否支持 ALGORITHM=INSTANT, 当支持时自动关闭pt-osc/gh-ost.
+	// 执行大表变更前尝试 ALGORITHM=INSTANT，支持 MySQL 5.7/8.0 等具备 INSTANT 能力的版本。
 	EnableDDLInstant bool `toml:"enable_ddl_instant" json:"enable_ddl_instant"`
 
 	// explain判断受影响行数时使用的规则, 默认值"first"

@@ -3853,6 +3853,13 @@ func buildInstantAlterSQL(node *ast.AlterTableStmt) (string, bool, error) {
 	return builder.String(), true, err
 }
 
+func (s *session) execInstantDDL(sqlStr string) (sql.Result, error) {
+	if s.ddlDB != nil {
+		return s.execDDL(sqlStr, false)
+	}
+	return s.exec(sqlStr, false)
+}
+
 func (s *session) tryExecuteAlterTableInstant(record *Record, node *ast.AlterTableStmt) instantExecResult {
 	instantSQL, ok, err := buildInstantAlterSQL(node)
 	if !ok {
@@ -3867,21 +3874,7 @@ func (s *session) tryExecuteAlterTableInstant(record *Record, node *ast.AlterTab
 
 	log.Infof("con:%d try ALGORITHM=INSTANT before pt-osc: %s", s.sessionVars.ConnectionID, instantSQL)
 	if s.osc.OscInstantLockWaitTimeout > 0 {
-		var oldLockWaitTimeout int
-		row := s.ddlDB.DB().QueryRow("SELECT @@session.lock_wait_timeout")
-		if err = row.Scan(&oldLockWaitTimeout); err != nil {
-			log.Errorf("con:%d get instant lock_wait_timeout failed: %v", s.sessionVars.ConnectionID, err)
-			s.appendErrorMsg(err.Error())
-			record.StageStatus = StatusExecFail
-			return instantExecFail
-		}
-		defer func() {
-			if _, err := s.execDDL(fmt.Sprintf("SET SESSION lock_wait_timeout=%d", oldLockWaitTimeout), false); err != nil {
-				log.Errorf("con:%d restore instant lock_wait_timeout failed: %v", s.sessionVars.ConnectionID, err)
-			}
-		}()
-
-		_, err = s.execDDL(fmt.Sprintf("SET SESSION lock_wait_timeout=%d", s.osc.OscInstantLockWaitTimeout), false)
+		_, err = s.execInstantDDL(fmt.Sprintf("SET SESSION lock_wait_timeout=%d", s.osc.OscInstantLockWaitTimeout))
 		if err != nil {
 			log.Errorf("con:%d set instant lock_wait_timeout failed: %v", s.sessionVars.ConnectionID, err)
 			s.appendErrorMsg(err.Error())
@@ -3890,7 +3883,7 @@ func (s *session) tryExecuteAlterTableInstant(record *Record, node *ast.AlterTab
 		}
 	}
 
-	res, err := s.execDDL(instantSQL, false)
+	res, err := s.execInstantDDL(instantSQL)
 	if err != nil {
 		if isInstantUnsupportedError(err) {
 			log.Infof("con:%d ALGORITHM=INSTANT unsupported, fallback to pt-osc: %v", s.sessionVars.ConnectionID, err)
