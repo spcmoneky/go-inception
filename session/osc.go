@@ -96,22 +96,66 @@ func (s *session) checkOscTargetTableIdle(t *TableInfo) bool {
 		threshold = 2
 	}
 
+	blockers, precise, err := s.fetchOscTargetTableBlockers(t, threshold)
+	if err != nil {
+		log.Errorf("con:%d check osc target table idle failed: %v", s.sessionVars.ConnectionID, err)
+		s.appendErrorMsg(fmt.Sprintf("pt-osc precheck failed for `%s`.`%s`: cannot query processlist/innodb_trx: %v", t.Schema, t.Name, err))
+		return false
+	}
+	if len(blockers) > 0 {
+		scope := fmt.Sprintf("`%s`.`%s`", t.Schema, t.Name)
+		if !precise {
+			scope = fmt.Sprintf("database `%s` SQL text referencing `%s` because performance_schema metadata lock instrumentation is disabled", t.Schema, t.Name)
+		}
+		s.appendErrorMsg(fmt.Sprintf("pt-osc precheck failed for %s: found SELECT or transaction longer than %d seconds: %s", scope, threshold, strings.Join(blockers, "; ")))
+		return false
+	}
+
+	return true
+}
+
+func (s *session) fetchOscTargetTableBlockers(t *TableInfo, threshold int) ([]string, bool, error) {
+	if s.metadataLockInstrumentationEnabled() {
+		blockers, err := s.fetchMetadataLockBlockers(t, threshold)
+		return blockers, true, err
+	}
+
+	log.Warnf("con:%d performance_schema metadata lock instrumentation disabled, fallback to SQL-text pt-osc precheck for %s.%s", s.sessionVars.ConnectionID, t.Schema, t.Name)
+	blockers, err := s.fetchSQLTextBlockers(t, threshold)
+	return blockers, false, err
+}
+
+func (s *session) metadataLockInstrumentationEnabled() bool {
 	setupSQL := `
 SELECT COUNT(*)
 FROM performance_schema.setup_instruments
 WHERE NAME = 'wait/lock/metadata/sql/mdl'
   AND ENABLED = 'YES';`
-	var enabledCount int
-	if err := s.rawScan(setupSQL, &enabledCount); err != nil {
-		log.Errorf("con:%d check metadata lock instrumentation failed: %v", s.sessionVars.ConnectionID, err)
-		s.appendErrorMsg(fmt.Sprintf("pt-osc precheck failed for `%s`.`%s`: cannot verify performance_schema metadata lock instrumentation: %v", t.Schema, t.Name, err))
-		return false
+	rows, err := s.raw(setupSQL)
+	if rows != nil {
+		defer rows.Close()
 	}
-	if enabledCount == 0 {
-		s.appendErrorMsg(fmt.Sprintf("pt-osc precheck failed for `%s`.`%s`: performance_schema metadata lock instrumentation wait/lock/metadata/sql/mdl is disabled", t.Schema, t.Name))
+	if err != nil {
+		log.Warnf("con:%d cannot verify metadata lock instrumentation: %v", s.sessionVars.ConnectionID, err)
 		return false
 	}
 
+	var enabledCount int
+	if rows.Next() {
+		if err := rows.Scan(&enabledCount); err != nil {
+			log.Warnf("con:%d scan metadata lock instrumentation failed: %v", s.sessionVars.ConnectionID, err)
+			return false
+		}
+	}
+	if err := rows.Err(); err != nil {
+		log.Warnf("con:%d iterate metadata lock instrumentation failed: %v", s.sessionVars.ConnectionID, err)
+		return false
+	}
+
+	return enabledCount > 0
+}
+
+func (s *session) fetchMetadataLockBlockers(t *TableInfo, threshold int) ([]string, error) {
 	sql := fmt.Sprintf(`
 SELECT
 	p.ID,
@@ -139,14 +183,50 @@ WHERE ml.OBJECT_TYPE = 'TABLE'
 ORDER BY GREATEST(IFNULL(p.TIME, 0), IFNULL(TIMESTAMPDIFF(SECOND, trx.trx_started, NOW()), 0)) DESC
 LIMIT 10;`, strings.Replace(t.Schema, "'", "''", -1), strings.Replace(t.Name, "'", "''", -1), threshold, threshold)
 
+	return s.scanOscBlockers(sql)
+}
+
+func (s *session) fetchSQLTextBlockers(t *TableInfo, threshold int) ([]string, error) {
+	schema := strings.Replace(t.Schema, "'", "''", -1)
+	table := strings.Replace(t.Name, "'", "''", -1)
+	sql := fmt.Sprintf("SELECT "+
+		"p.ID, "+
+		"IFNULL(p.USER, ''), "+
+		"IFNULL(p.HOST, ''), "+
+		"IFNULL(p.DB, ''), "+
+		"IFNULL(p.COMMAND, ''), "+
+		"IFNULL(p.TIME, 0), "+
+		"IFNULL(TIMESTAMPDIFF(SECOND, trx.trx_started, NOW()), 0) AS trx_time, "+
+		"IFNULL(p.STATE, ''), "+
+		"IFNULL(p.INFO, '') "+
+		"FROM information_schema.PROCESSLIST p "+
+		"LEFT JOIN information_schema.innodb_trx trx ON trx.trx_mysql_thread_id = p.ID "+
+		"WHERE p.ID <> CONNECTION_ID() "+
+		"AND p.DB = '%s' "+
+		"AND p.INFO IS NOT NULL "+
+		"AND ("+
+		"p.INFO LIKE '%%%s%%' "+
+		"OR p.INFO LIKE '%%`%s`%%' "+
+		"OR p.INFO LIKE '%%.%s%%' "+
+		"OR p.INFO LIKE '%%.`%s`%%'"+
+		") "+
+		"AND ("+
+		"(UPPER(p.COMMAND) = 'QUERY' AND p.TIME >= %d AND UPPER(TRIM(IFNULL(p.INFO, ''))) LIKE 'SELECT%%') "+
+		"OR (trx.trx_started IS NOT NULL AND TIMESTAMPDIFF(SECOND, trx.trx_started, NOW()) >= %d)"+
+		") "+
+		"ORDER BY GREATEST(IFNULL(p.TIME, 0), IFNULL(TIMESTAMPDIFF(SECOND, trx.trx_started, NOW()), 0)) DESC "+
+		"LIMIT 10;", schema, table, table, table, table, threshold, threshold)
+
+	return s.scanOscBlockers(sql)
+}
+
+func (s *session) scanOscBlockers(sql string) ([]string, error) {
 	rows, err := s.raw(sql)
 	if rows != nil {
 		defer rows.Close()
 	}
 	if err != nil {
-		log.Errorf("con:%d check osc target table idle failed: %v", s.sessionVars.ConnectionID, err)
-		s.appendErrorMsg(fmt.Sprintf("pt-osc precheck failed for `%s`.`%s`: cannot query performance_schema.metadata_locks/information_schema.innodb_trx, please grant PROCESS and enable metadata lock instrumentation: %v", t.Schema, t.Name, err))
-		return false
+		return nil, err
 	}
 
 	var blockers []string
@@ -155,9 +235,7 @@ LIMIT 10;`, strings.Replace(t.Schema, "'", "''", -1), strings.Replace(t.Name, "'
 		var user, host, db, command, state, info string
 		var queryTime, trxTime int64
 		if err := rows.Scan(&id, &user, &host, &db, &command, &queryTime, &trxTime, &state, &info); err != nil {
-			log.Errorf("con:%d scan osc target table idle failed: %v", s.sessionVars.ConnectionID, err)
-			s.appendErrorMsg(err.Error())
-			return false
+			return nil, err
 		}
 		if len(info) > 200 {
 			info = info[:200]
@@ -165,16 +243,10 @@ LIMIT 10;`, strings.Replace(t.Schema, "'", "''", -1), strings.Replace(t.Name, "'
 		blockers = append(blockers, fmt.Sprintf("thread=%d user=%s host=%s db=%s command=%s time=%ds trx_time=%ds state=%s sql=%s", id, user, host, db, command, queryTime, trxTime, state, info))
 	}
 	if err := rows.Err(); err != nil {
-		log.Errorf("con:%d iterate osc target table idle failed: %v", s.sessionVars.ConnectionID, err)
-		s.appendErrorMsg(err.Error())
-		return false
-	}
-	if len(blockers) > 0 {
-		s.appendErrorMsg(fmt.Sprintf("pt-osc precheck failed for `%s`.`%s`: found SELECT or transaction holding metadata lock longer than %d seconds: %s", t.Schema, t.Name, threshold, strings.Join(blockers, "; ")))
-		return false
+		return nil, err
 	}
 
-	return true
+	return blockers, nil
 }
 
 func (s *session) mysqlExecuteAlterTableOsc(r *Record) {
