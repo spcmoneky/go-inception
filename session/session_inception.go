@@ -1497,6 +1497,18 @@ func (s *session) executeRemoteStatement(record *Record, isTran bool) {
 	start := time.Now()
 
 	if record.useOsc {
+		if node, ok := record.Type.(*ast.AlterTableStmt); ok && !s.ghost.GhostOn && s.inc.EnableDDLInstant {
+			instantResult := s.tryExecuteAlterTableInstant(record, node)
+			record.ExecTime = fmt.Sprintf("%.3f", time.Since(start).Seconds())
+			record.ExecTimestamp = time.Now().Unix()
+			switch instantResult {
+			case instantExecOK:
+				return
+			case instantExecFail:
+				return
+			}
+		}
+
 		if s.ghost.GhostOn {
 			if s.ghost.GhostBinDir != "" {
 				log.Infof("con:%d use binary gh-ost: %s",
@@ -3798,22 +3810,136 @@ func checkDDLInstantMySQL80(node *ast.AlterTableStmt, t *TableInfo, dbVersion in
 	return canInstant
 }
 
-// checkDDLInstant 检查是否支持 ALGORITHM=INSTANT, 当支持时自动关闭pt-osc/gh-ost.
-func (s *session) checkDDLInstant(node *ast.AlterTableStmt, t *TableInfo) {
-	if !s.inc.EnableDDLInstant || !s.myRecord.useOsc || s.dbVersion < 50700 {
-		return
-	}
+type instantExecResult int
 
-	if s.dbVersion < 80000 {
-		if checkDDLInstantMySQL57(node) {
-			s.myRecord.useOsc = false
+const (
+	instantExecSkipped instantExecResult = iota
+	instantExecOK
+	instantExecFallback
+	instantExecFail
+)
+
+func buildInstantAlterSQL(node *ast.AlterTableStmt) (string, bool, error) {
+	for _, spec := range node.Specs {
+		if spec.Tp == ast.AlterTableAlgorithm {
+			switch spec.Algorithm {
+			case ast.AlgorithmTypeDefault:
+				spec.Algorithm = ast.AlgorithmTypeInstant
+				defer func(spec *ast.AlterTableSpec) {
+					spec.Algorithm = ast.AlgorithmTypeDefault
+				}(spec)
+			case ast.AlgorithmTypeInstant:
+			default:
+				return "", false, nil
+			}
+
+			var builder strings.Builder
+			err := node.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &builder))
+			return builder.String(), true, err
 		}
-		return
 	}
 
-	if checkDDLInstantMySQL80(node, t, s.dbVersion) {
-		s.myRecord.useOsc = false
+	instantSpec := &ast.AlterTableSpec{
+		Tp:        ast.AlterTableAlgorithm,
+		Algorithm: ast.AlgorithmTypeInstant,
 	}
+	node.Specs = append(node.Specs, instantSpec)
+	defer func() {
+		node.Specs = node.Specs[:len(node.Specs)-1]
+	}()
+
+	var builder strings.Builder
+	err := node.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &builder))
+	return builder.String(), true, err
+}
+
+func (s *session) tryExecuteAlterTableInstant(record *Record, node *ast.AlterTableStmt) instantExecResult {
+	instantSQL, ok, err := buildInstantAlterSQL(node)
+	if !ok {
+		return instantExecSkipped
+	}
+	if err != nil {
+		log.Errorf("con:%d build instant alter sql failed: %v", s.sessionVars.ConnectionID, err)
+		s.appendErrorMsg(err.Error())
+		record.StageStatus = StatusExecFail
+		return instantExecFail
+	}
+
+	log.Infof("con:%d try ALGORITHM=INSTANT before pt-osc: %s", s.sessionVars.ConnectionID, instantSQL)
+	if s.osc.OscInstantLockWaitTimeout > 0 {
+		var oldLockWaitTimeout int
+		row := s.ddlDB.DB().QueryRow("SELECT @@session.lock_wait_timeout")
+		if err = row.Scan(&oldLockWaitTimeout); err != nil {
+			log.Errorf("con:%d get instant lock_wait_timeout failed: %v", s.sessionVars.ConnectionID, err)
+			s.appendErrorMsg(err.Error())
+			record.StageStatus = StatusExecFail
+			return instantExecFail
+		}
+		defer func() {
+			if _, err := s.execDDL(fmt.Sprintf("SET SESSION lock_wait_timeout=%d", oldLockWaitTimeout), false); err != nil {
+				log.Errorf("con:%d restore instant lock_wait_timeout failed: %v", s.sessionVars.ConnectionID, err)
+			}
+		}()
+
+		_, err = s.execDDL(fmt.Sprintf("SET SESSION lock_wait_timeout=%d", s.osc.OscInstantLockWaitTimeout), false)
+		if err != nil {
+			log.Errorf("con:%d set instant lock_wait_timeout failed: %v", s.sessionVars.ConnectionID, err)
+			s.appendErrorMsg(err.Error())
+			record.StageStatus = StatusExecFail
+			return instantExecFail
+		}
+	}
+
+	res, err := s.execDDL(instantSQL, false)
+	if err != nil {
+		if isInstantUnsupportedError(err) {
+			log.Infof("con:%d ALGORITHM=INSTANT unsupported, fallback to pt-osc: %v", s.sessionVars.ConnectionID, err)
+			s.appendWarningMessage(fmt.Sprintf("ALGORITHM=INSTANT unsupported, fallback to pt-osc: %v", err))
+			return instantExecFallback
+		}
+
+		log.Errorf("con:%d ALGORITHM=INSTANT execution failed: %v", s.sessionVars.ConnectionID, err)
+		if myErr, ok := err.(*mysqlDriver.MySQLError); ok {
+			s.appendErrorMsg(myErr.Message)
+		} else {
+			s.appendErrorMsg(err.Error())
+		}
+		record.StageStatus = StatusExecFail
+		return instantExecFail
+	}
+
+	affectedRows, err := res.RowsAffected()
+	if err != nil {
+		s.appendErrorMsg(err.Error())
+	}
+	record.AffectedRows = affectedRows
+	record.ThreadId = s.fetchThreadID()
+	if record.ThreadId == 0 {
+		s.appendErrorMsg("无法获取线程号")
+	} else {
+		record.ExecComplete = true
+	}
+	record.StageStatus = StatusExecOK
+	return instantExecOK
+}
+
+func isInstantUnsupportedError(err error) bool {
+	myErr, ok := err.(*mysqlDriver.MySQLError)
+	if !ok {
+		return false
+	}
+
+	message := strings.ToUpper(myErr.Message)
+	switch myErr.Number {
+	case 1064, 1235, 1845, 1846, 1847, 1848:
+		return strings.Contains(message, "INSTANT") || strings.Contains(message, "ALGORITHM")
+	}
+
+	return false
+}
+
+// checkDDLInstant is intentionally a no-op; real ALGORITHM=INSTANT probing happens at execution time.
+func (s *session) checkDDLInstant(node *ast.AlterTableStmt, t *TableInfo) {
 }
 
 func (s *session) checkMultiPartitionParts(specs []*ast.AlterTableSpec) {

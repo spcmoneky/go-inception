@@ -14,12 +14,72 @@
 package session
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/hanchuanchuan/goInception/ast"
+	"github.com/hanchuanchuan/goInception/format"
 	"github.com/hanchuanchuan/goInception/parser"
 	"github.com/hanchuanchuan/goInception/sessionctx/variable"
 )
+
+func Test_buildInstantAlterSQL(t *testing.T) {
+	parser := parser.New()
+	sessionVars := variable.NewSessionVars()
+	parser.SetSQLMode(sessionVars.SQLMode)
+
+	tests := []struct {
+		sql     string
+		ok      bool
+		want    string
+		restore string
+	}{
+		{
+			sql:     "alter table t1 add column c1 int;",
+			ok:      true,
+			want:    "ALTER TABLE `t1` ADD COLUMN `c1` INT, ALGORITHM = INSTANT",
+			restore: "ALTER TABLE `t1` ADD COLUMN `c1` INT",
+		},
+		{
+			sql:     "alter table t1 add column c1 int, algorithm=instant;",
+			ok:      true,
+			want:    "ALTER TABLE `t1` ADD COLUMN `c1` INT, ALGORITHM = INSTANT",
+			restore: "ALTER TABLE `t1` ADD COLUMN `c1` INT, ALGORITHM = INSTANT",
+		},
+		{
+			sql: "alter table t1 add column c1 int, algorithm=inplace;",
+			ok:  false,
+		},
+	}
+
+	for _, test := range tests {
+		stmts, _, err := parser.Parse(test.sql, "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		node := stmts[0].(*ast.AlterTableStmt)
+		instantSQL, ok, err := buildInstantAlterSQL(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok != test.ok {
+			t.Fatalf("ok is %v, expected %v: %s", ok, test.ok, test.sql)
+		}
+		if instantSQL != test.want {
+			t.Fatalf("sql is %s, expected %s", instantSQL, test.want)
+		}
+		if test.restore != "" {
+			var builder strings.Builder
+			err = node.Restore(format.NewRestoreCtx(format.DefaultRestoreFlags, &builder))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if builder.String() != test.restore {
+				t.Fatalf("restored sql is %s, expected %s", builder.String(), test.restore)
+			}
+		}
+	}
+}
 
 func Test_checkDDLInstantMySQL(t *testing.T) {
 	parser := parser.New()

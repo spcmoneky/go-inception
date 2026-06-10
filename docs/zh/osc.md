@@ -83,6 +83,9 @@ osc_critical_thread_running                   | 80             | int | 对应参
 osc_drop_new_table                     | true           | bool | 对应参数--[no]drop-new-table
 osc_drop_old_table                     | true           | bool | 对应参数--[no]drop-old-table
 osc_max_flow_ctl `v1.2.2`              | -1           | int | 对应参数--max-flow-ctl. 检查集群暂停流量控制所花费的平均时间 (仅适用于PXC 5.6及以上版本,版本自动判断). -1表示不开启. 非PXC集群会自动忽略该参数
+osc_check_long_query                  | true           | bool | pt-osc执行前是否检查目标表上超过阈值的SELECT或事务
+osc_instant_lock_wait_timeout          | 2              | int | 尝试原生ALGORITHM=INSTANT时使用的lock_wait_timeout
+osc_long_query_time                    | 2              | int | pt-osc执行前目标表长SELECT或长事务阈值，单位秒
 osc_max_lag                            | 3              | int | 对应参数--max-lag
 osc_max_thread_connected                      | 1000           | int | 对应参数--max-load中的thread_connected部分
 osc_max_thread_running                        | 80             | int | 对应参数--max-load中的thread_running部分

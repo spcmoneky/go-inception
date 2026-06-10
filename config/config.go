@@ -444,6 +444,15 @@ type Osc struct {
 	// 对应参数pt-online-schema-change中的参数 --set-vars lock_wait_timeout=60s
 	OscLockWaitTimeout int `toml:"osc_lock_wait_timeout" json:"osc_lock_wait_timeout"`
 
+	// 尝试 ALGORITHM=INSTANT 时使用的 lock_wait_timeout，默认2秒
+	OscInstantLockWaitTimeout int `toml:"osc_instant_lock_wait_timeout" json:"osc_instant_lock_wait_timeout"`
+
+	// pt-osc执行前是否检查目标表上的长SELECT或长事务
+	OscCheckLongQuery bool `toml:"osc_check_long_query" json:"osc_check_long_query"`
+
+	// pt-osc执行前目标表长SELECT或长事务阈值，单位秒
+	OscLongQueryTime int `toml:"osc_long_query_time" json:"osc_long_query_time"`
+
 	// 对应参数pt-online-schema-change中的参数--[no]check-replication-filters。默认值：ON
 	OscCheckReplicationFilters bool `toml:"osc_check_replication_filters" json:"osc_check_replication_filters"`
 	// 是否检查唯一索引,默认检查,如果是,则禁止
@@ -744,6 +753,9 @@ var defaultConf = Config{
 		OscMaxFlowCtl:              -1,
 		OscSleep:                   0.0,
 		OscLockWaitTimeout:         60,
+		OscInstantLockWaitTimeout:  2,
+		OscCheckLongQuery:          true,
+		OscLongQueryTime:           2,
 		OscCheckAlter:              true,
 		OscCheckReplicationFilters: true,
 		OscCheckUniqueKeyChange:    true,

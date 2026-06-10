@@ -79,6 +79,9 @@ osc_critical_thread_connected                 | 1000           | int | correspon
 osc_critical_thread_running                   | 80             | int | correspond `--critical-load中的thread_running`
 osc_drop_new_table                     | true           | bool | correspond `--[no]drop-new-table`
 osc_drop_old_table                     | true           | bool | correspond `--[no]drop-old-table`
+osc_check_long_query                  | true           | bool | check long SELECT or transaction holding metadata lock on target table before pt-osc
+osc_instant_lock_wait_timeout          | 2              | int | lock_wait_timeout used when trying native ALGORITHM=INSTANT before pt-osc
+osc_long_query_time                    | 2              | int | threshold in seconds for long SELECT or transaction precheck before pt-osc
 osc_max_lag                            | 3              | int | correspond `--max-lag`
 osc_max_thread_connected                      | 1000           | int | correspond `--max-load中的thread_connected`
 osc_max_thread_running                        | 80             | int | correspond `--max-load中的thread_running`

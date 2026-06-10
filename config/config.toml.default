@@ -159,6 +159,15 @@ osc_sleep = 0.0
 # 对应参数pt-online-schema-change中的参数 --set-vars lock_wait_timeout=?
 osc_lock_wait_timeout = 60
 
+# 尝试 ALGORITHM=INSTANT 时使用的 lock_wait_timeout，默认2秒
+osc_instant_lock_wait_timeout = 2
+
+# pt-osc执行前是否检查目标表上的长SELECT或长事务
+osc_check_long_query = true
+
+# pt-osc执行前目标表长SELECT或长事务阈值，单位秒
+osc_long_query_time = 2
+
 # 对应参数pt-online-schema-change中的参数--[no]check-alter。默认值：ON
 osc_check_alter = true
 

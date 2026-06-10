@@ -86,7 +86,102 @@ func (s *session) mysqlComputeSqlSha1(r *Record) {
 	r.Sqlsha1 = auth.EncodePassword(buf.String())
 }
 
+func (s *session) checkOscTargetTableIdle(t *TableInfo) bool {
+	if !s.osc.OscCheckLongQuery || t == nil {
+		return true
+	}
+
+	threshold := s.osc.OscLongQueryTime
+	if threshold <= 0 {
+		threshold = 2
+	}
+
+	setupSQL := `
+SELECT COUNT(*)
+FROM performance_schema.setup_instruments
+WHERE NAME = 'wait/lock/metadata/sql/mdl'
+  AND ENABLED = 'YES';`
+	var enabledCount int
+	if err := s.rawScan(setupSQL, &enabledCount); err != nil {
+		log.Errorf("con:%d check metadata lock instrumentation failed: %v", s.sessionVars.ConnectionID, err)
+		s.appendErrorMsg(fmt.Sprintf("pt-osc precheck failed for `%s`.`%s`: cannot verify performance_schema metadata lock instrumentation: %v", t.Schema, t.Name, err))
+		return false
+	}
+	if enabledCount == 0 {
+		s.appendErrorMsg(fmt.Sprintf("pt-osc precheck failed for `%s`.`%s`: performance_schema metadata lock instrumentation wait/lock/metadata/sql/mdl is disabled", t.Schema, t.Name))
+		return false
+	}
+
+	sql := fmt.Sprintf(`
+SELECT
+	p.ID,
+	IFNULL(p.USER, ''),
+	IFNULL(p.HOST, ''),
+	IFNULL(p.DB, ''),
+	IFNULL(p.COMMAND, ''),
+	IFNULL(p.TIME, 0),
+	IFNULL(TIMESTAMPDIFF(SECOND, trx.trx_started, NOW()), 0) AS trx_time,
+	IFNULL(p.STATE, ''),
+	IFNULL(p.INFO, '')
+FROM performance_schema.metadata_locks ml
+JOIN performance_schema.threads th ON th.THREAD_ID = ml.OWNER_THREAD_ID
+JOIN information_schema.PROCESSLIST p ON p.ID = th.PROCESSLIST_ID
+LEFT JOIN information_schema.innodb_trx trx ON trx.trx_mysql_thread_id = p.ID
+WHERE ml.OBJECT_TYPE = 'TABLE'
+  AND ml.OBJECT_SCHEMA = '%s'
+  AND ml.OBJECT_NAME = '%s'
+  AND ml.LOCK_STATUS = 'GRANTED'
+  AND p.ID <> CONNECTION_ID()
+  AND (
+    (UPPER(p.COMMAND) = 'QUERY' AND p.TIME >= %d AND UPPER(TRIM(IFNULL(p.INFO, ''))) LIKE 'SELECT%%')
+    OR (trx.trx_started IS NOT NULL AND TIMESTAMPDIFF(SECOND, trx.trx_started, NOW()) >= %d)
+  )
+ORDER BY GREATEST(IFNULL(p.TIME, 0), IFNULL(TIMESTAMPDIFF(SECOND, trx.trx_started, NOW()), 0)) DESC
+LIMIT 10;`, strings.Replace(t.Schema, "'", "''", -1), strings.Replace(t.Name, "'", "''", -1), threshold, threshold)
+
+	rows, err := s.raw(sql)
+	if rows != nil {
+		defer rows.Close()
+	}
+	if err != nil {
+		log.Errorf("con:%d check osc target table idle failed: %v", s.sessionVars.ConnectionID, err)
+		s.appendErrorMsg(fmt.Sprintf("pt-osc precheck failed for `%s`.`%s`: cannot query performance_schema.metadata_locks/information_schema.innodb_trx, please grant PROCESS and enable metadata lock instrumentation: %v", t.Schema, t.Name, err))
+		return false
+	}
+
+	var blockers []string
+	for rows.Next() {
+		var id int64
+		var user, host, db, command, state, info string
+		var queryTime, trxTime int64
+		if err := rows.Scan(&id, &user, &host, &db, &command, &queryTime, &trxTime, &state, &info); err != nil {
+			log.Errorf("con:%d scan osc target table idle failed: %v", s.sessionVars.ConnectionID, err)
+			s.appendErrorMsg(err.Error())
+			return false
+		}
+		if len(info) > 200 {
+			info = info[:200]
+		}
+		blockers = append(blockers, fmt.Sprintf("thread=%d user=%s host=%s db=%s command=%s time=%ds trx_time=%ds state=%s sql=%s", id, user, host, db, command, queryTime, trxTime, state, info))
+	}
+	if err := rows.Err(); err != nil {
+		log.Errorf("con:%d iterate osc target table idle failed: %v", s.sessionVars.ConnectionID, err)
+		s.appendErrorMsg(err.Error())
+		return false
+	}
+	if len(blockers) > 0 {
+		s.appendErrorMsg(fmt.Sprintf("pt-osc precheck failed for `%s`.`%s`: found SELECT or transaction holding metadata lock longer than %d seconds: %s", t.Schema, t.Name, threshold, strings.Join(blockers, "; ")))
+		return false
+	}
+
+	return true
+}
+
 func (s *session) mysqlExecuteAlterTableOsc(r *Record) {
+
+	if !s.checkOscTargetTableIdle(r.TableInfo) {
+		return
+	}
 
 	err := os.Setenv("PATH", fmt.Sprintf("%s%s%s",
 		s.osc.OscBinDir, string(os.PathListSeparator), os.Getenv("PATH")))
